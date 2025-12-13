@@ -195,6 +195,195 @@ GET  /strava-auth/callback → Exchanges code for tokens, creates/updates profil
 POST /strava-auth/refresh  → Refreshes expired access token
 ```
 
+#### Implementation Notes (Adapted from Existing Azure Functions)
+
+The existing `runnote-function` app has a working Strava OAuth implementation. Key patterns to preserve:
+
+**CSRF Protection (from stateStore.ts):**
+- Generate cryptographically secure state: `randomBytes(32).toString('hex')`
+- Store state with timestamp, validate within 10 minutes
+- One-time use: delete state after validation
+- For Supabase: use `oauth_states` table or encode state in signed JWT
+
+**Token Exchange (from strava.ts):**
+```typescript
+// This logic is portable - just change storage layer
+async function exchangeCodeForToken(code: string) {
+  const response = await fetch('https://www.strava.com/api/v3/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: STRAVA_CLIENT_ID,
+      client_secret: STRAVA_CLIENT_SECRET,
+      code,
+      grant_type: 'authorization_code',
+    }),
+  });
+  return response.json();
+}
+```
+
+**Token Refresh with Expiration Skew (from strava.ts):**
+```typescript
+// Check expiration with 60-second buffer
+function isExpired(expires_at: number, skew = 60): boolean {
+  const now = Math.floor(Date.now() / 1000);
+  return expires_at <= now + skew;
+}
+
+// Always call this before Strava API requests
+async function ensureValidTokens(userId: string): Promise<TokenData> {
+  const profile = await getProfile(userId);
+  if (isExpired(profile.strava_token_expires_at)) {
+    return await refreshTokens(profile);
+  }
+  return profile;
+}
+```
+
+**HTTPS Enforcement (from authConnect.ts):**
+```typescript
+// Validate redirect URI in production
+const isLocalDev = redirectUri.includes('localhost') || redirectUri.includes('127.0.0.1');
+if (!isLocalDev && !redirectUri.startsWith('https://')) {
+  throw new Error('Redirect URI must use HTTPS in production');
+}
+```
+
+#### Supabase Edge Function: strava-auth/login
+
+```typescript
+// supabase/functions/strava-auth/login.ts
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+Deno.serve(async (req) => {
+  const url = new URL(req.url);
+
+  // Generate CSRF state
+  const state = crypto.randomUUID();
+
+  // Store state in database (or use signed JWT approach)
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+  );
+
+  await supabase.from('oauth_states').insert({
+    state,
+    created_at: new Date().toISOString(),
+  });
+
+  // Build Strava authorization URL
+  const authUrl = new URL('https://www.strava.com/oauth/authorize');
+  authUrl.searchParams.set('client_id', Deno.env.get('STRAVA_CLIENT_ID')!);
+  authUrl.searchParams.set('redirect_uri', Deno.env.get('STRAVA_REDIRECT_URI')!);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('approval_prompt', 'auto');
+  authUrl.searchParams.set('scope', 'read,activity:read_all');
+  authUrl.searchParams.set('state', state);
+
+  return new Response(null, {
+    status: 302,
+    headers: { Location: authUrl.toString() },
+  });
+});
+```
+
+#### Supabase Edge Function: strava-auth/callback
+
+```typescript
+// supabase/functions/strava-auth/callback.ts
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+Deno.serve(async (req) => {
+  const url = new URL(req.url);
+  const code = url.searchParams.get('code');
+  const state = url.searchParams.get('state');
+
+  if (!code || !state) {
+    return new Response('Missing code or state', { status: 400 });
+  }
+
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+  );
+
+  // Validate and consume state (one-time use)
+  const { data: stateRecord, error: stateError } = await supabase
+    .from('oauth_states')
+    .select('*')
+    .eq('state', state)
+    .single();
+
+  if (stateError || !stateRecord) {
+    return new Response('Invalid state', { status: 403 });
+  }
+
+  // Check expiration (10 minutes)
+  const stateAge = Date.now() - new Date(stateRecord.created_at).getTime();
+  if (stateAge > 600000) {
+    await supabase.from('oauth_states').delete().eq('state', state);
+    return new Response('State expired', { status: 403 });
+  }
+
+  // Delete state (one-time use)
+  await supabase.from('oauth_states').delete().eq('state', state);
+
+  // Exchange code for tokens
+  const tokenResponse = await fetch('https://www.strava.com/api/v3/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: Deno.env.get('STRAVA_CLIENT_ID'),
+      client_secret: Deno.env.get('STRAVA_CLIENT_SECRET'),
+      code,
+      grant_type: 'authorization_code',
+    }),
+  });
+
+  const tokenData = await tokenResponse.json();
+
+  if (!tokenResponse.ok) {
+    return new Response('Token exchange failed', { status: 500 });
+  }
+
+  // Upsert profile with Strava tokens
+  const { error: upsertError } = await supabase.from('profiles').upsert({
+    strava_athlete_id: tokenData.athlete.id,
+    strava_access_token: tokenData.access_token,
+    strava_refresh_token: tokenData.refresh_token,
+    strava_token_expires_at: new Date(tokenData.expires_at * 1000).toISOString(),
+    updated_at: new Date().toISOString(),
+  }, {
+    onConflict: 'strava_athlete_id',
+  });
+
+  if (upsertError) {
+    return new Response('Failed to save tokens', { status: 500 });
+  }
+
+  // Redirect to app dashboard
+  return new Response(null, {
+    status: 302,
+    headers: { Location: `${Deno.env.get('APP_URL')}/dashboard?connected=true` },
+  });
+});
+```
+
+#### OAuth States Table (Add to Schema)
+
+```sql
+-- Temporary OAuth states for CSRF protection
+create table public.oauth_states (
+  state text primary key,
+  created_at timestamp with time zone default now()
+);
+
+-- Auto-cleanup old states (run via pg_cron or manually)
+-- delete from public.oauth_states where created_at < now() - interval '10 minutes';
+```
+
 ### 2. Strava Sync (`/functions/strava-sync`)
 
 Pulls new activities from Strava API.
@@ -202,6 +391,63 @@ Pulls new activities from Strava API.
 ```
 POST /strava-sync          → Syncs activities for authenticated user
                              (called on-demand or via cron)
+```
+
+#### Token Refresh Pattern
+
+```typescript
+// Reusable token refresh logic for any Strava API call
+async function refreshStravaTokens(profile: Profile): Promise<Profile> {
+  const response = await fetch('https://www.strava.com/api/v3/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: Deno.env.get('STRAVA_CLIENT_ID'),
+      client_secret: Deno.env.get('STRAVA_CLIENT_SECRET'),
+      grant_type: 'refresh_token',
+      refresh_token: profile.strava_refresh_token,
+    }),
+  });
+
+  const data = await response.json();
+
+  // Update tokens in database
+  const { data: updated } = await supabase
+    .from('profiles')
+    .update({
+      strava_access_token: data.access_token,
+      strava_refresh_token: data.refresh_token,
+      strava_token_expires_at: new Date(data.expires_at * 1000).toISOString(),
+    })
+    .eq('id', profile.id)
+    .select()
+    .single();
+
+  return updated;
+}
+
+// Wrapper for any Strava API call with auto-refresh
+async function callStravaAPI(profile: Profile, endpoint: string): Promise<any> {
+  // Check if token needs refresh (60-second buffer)
+  const expiresAt = new Date(profile.strava_token_expires_at).getTime() / 1000;
+  const now = Math.floor(Date.now() / 1000);
+
+  if (expiresAt <= now + 60) {
+    profile = await refreshStravaTokens(profile);
+  }
+
+  const response = await fetch(`https://www.strava.com/api/v3${endpoint}`, {
+    headers: { Authorization: `Bearer ${profile.strava_access_token}` },
+  });
+
+  // Handle token expiration during request (race condition)
+  if (response.status === 401) {
+    profile = await refreshStravaTokens(profile);
+    return callStravaAPI(profile, endpoint); // Retry once
+  }
+
+  return response.json();
+}
 ```
 
 ### 3. Generate Summary (`/functions/generate-summary`)
